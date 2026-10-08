@@ -756,6 +756,8 @@ it.each([
   "DYLD_PRINT_RPATHS=1",
   "DYLD_LIBRARY_PATH_LOG=/tmp",
   "DYLD_LIBRARY_PATH",
+  "DYLD_IMAGE_SUFFIX=",
+  "DYLD_INSERT_LIBRARIES=",
 ])(
   "retains %s as an observation without adding path uncertainty",
   async (setting) => {
@@ -800,5 +802,156 @@ it.each(["execute", "bundle", "other"] as const)(
       resolution: { status: "unresolved", image: null },
     });
     expect(trace.edges).toHaveLength(1);
+  },
+);
+
+it.each([
+  "@loader_path/child.dylib",
+  "@executable_path/child.dylib",
+  "@rpath/child.dylib",
+])(
+  "keeps a found %s definitive under library fallback paths",
+  async (install_name) => {
+    const child = "Contents/MacOS/child.dylib";
+    const trace = await traceDylibLoading(
+      memoryView({
+        [MAIN]: executable({
+          dyld_environment: ["DYLD_FALLBACK_LIBRARY_PATH=/fallback"],
+          rpaths: ["@executable_path"],
+          dependencies: [dependency(install_name)],
+        }),
+        [child]: parsed(
+          slice({
+            dependencies: [dependency("@loader_path/grandchild.dylib")],
+          }),
+        ),
+        "Contents/MacOS/grandchild.dylib": parsed(slice()),
+      }),
+      { roots: [MAIN] },
+    );
+    expect(trace.edges.map(({ resolution }) => resolution.status)).toEqual([
+      "resolved",
+      "resolved",
+    ]);
+    expect(
+      trace.edges.every(({ loader_conditional }) => !loader_conditional),
+    ).toBe(true);
+    expect(trace.coverage.status).toBe("complete");
+  },
+);
+
+it.each([
+  [
+    "DYLD_FRAMEWORK_PATH=/override",
+    "@loader_path/child.dylib",
+    "resolved",
+    "complete",
+  ],
+  [
+    "DYLD_FRAMEWORK_PATH=/override",
+    "@loader_path/Foo.framework/Libraries/child.dylib",
+    "resolved",
+    "complete",
+  ],
+  [
+    "DYLD_FRAMEWORK_PATH=/override",
+    "@loader_path/Foo.framework/Bar",
+    "resolved",
+    "complete",
+  ],
+  [
+    "DYLD_FRAMEWORK_PATH=/override",
+    "@loader_path/Foo.framework/Foo",
+    "conditional",
+    "partial",
+  ],
+  [
+    "DYLD_FRAMEWORK_PATH=/override",
+    "@loader_path/Foo.framework/Versions/A/Foo",
+    "conditional",
+    "partial",
+  ],
+  [
+    "DYLD_LIBRARY_PATH=/override",
+    "@loader_path/Foo.framework/Foo",
+    "resolved",
+    "complete",
+  ],
+  [
+    "DYLD_LIBRARY_PATH=/override",
+    "@loader_path/Foo.framework/Libraries/child.dylib",
+    "conditional",
+    "partial",
+  ],
+  [
+    "DYLD_FALLBACK_FRAMEWORK_PATH=/fallback",
+    "@loader_path/Foo.framework/Foo",
+    "resolved",
+    "complete",
+  ],
+  [
+    "DYLD_FALLBACK_FRAMEWORK_PATH=/fallback",
+    "@loader_path/child.dylib",
+    "resolved",
+    "complete",
+  ],
+] as const)(
+  "scopes %s to the image kind and reached search phase of %s",
+  async (setting, install_name, status, coverage) => {
+    const child = install_name.replace("@loader_path", "Contents/MacOS");
+    const trace = await traceDylibLoading(
+      memoryView({
+        [MAIN]: executable({
+          dyld_environment: [setting],
+          dependencies: [dependency(install_name)],
+        }),
+        [child]: parsed(slice()),
+      }),
+      { roots: [MAIN] },
+    );
+    expect(trace.edges[0]?.resolution).toEqual({ status, image: child });
+    expect(trace.coverage.status).toBe(coverage);
+  },
+);
+
+it.each([
+  [
+    "DYLD_FALLBACK_LIBRARY_PATH=/fallback",
+    "@loader_path/missing.dylib",
+    "undetermined",
+    "partial",
+  ],
+  [
+    "DYLD_FALLBACK_FRAMEWORK_PATH=/fallback",
+    "@loader_path/Foo.framework/Foo",
+    "undetermined",
+    "partial",
+  ],
+  [
+    "DYLD_FALLBACK_FRAMEWORK_PATH=/fallback",
+    "@loader_path/missing.dylib",
+    "unresolved",
+    "complete",
+  ],
+  [
+    "DYLD_FALLBACK_LIBRARY_PATH=/fallback",
+    "@loader_path/Foo.framework/Foo",
+    "unresolved",
+    "complete",
+  ],
+] as const)(
+  "retains the applicable fallback uncertainty for %s and %s",
+  async (setting, install_name, status, coverage) => {
+    const trace = await traceDylibLoading(
+      memoryView({
+        [MAIN]: executable({
+          dyld_environment: [setting],
+          dependencies: [dependency(install_name)],
+        }),
+      }),
+      { roots: [MAIN] },
+    );
+    expect(trace.edges[0]?.resolution).toEqual({ status, image: null });
+    expect(trace.coverage.status).toBe(coverage);
   },
 );

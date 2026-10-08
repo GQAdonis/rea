@@ -206,53 +206,55 @@ it.skipIf(process.getuid?.() === 0)(
   },
 );
 
-it.each(["DYLD_LIBRARY_PATH=/external", "DYLD_PRINT_RPATHS=1"])(
-  "preserves %s and its resolution semantics through MCP",
-  async (setting) => {
-    const root = await createTestTempDirectory("rea-dylib-environment-mcp-");
-    const program = join(root, "program");
-    await writeFile(
-      program,
-      machoImage({
-        commands: [
-          dyldEnvironmentCommand(setting),
-          buildVersionCommand(1),
-          dylibCommand(LC.LOAD_DYLIB, "@loader_path/child.dylib"),
-        ],
-      }),
-    );
-    await writeFile(
-      join(root, "child.dylib"),
-      machoImage({
-        fileType: FILE_TYPE.dylib,
-        commands: [buildVersionCommand(1)],
-      }),
-    );
-    await withClient(async (client) => {
-      const opened = await client.callTool({
-        name: "open_binary",
-        arguments: { path: program },
-      });
-      expect(opened.isError).not.toBe(true);
-      const result = await client.callTool({
-        name: "trace_dylib_resolution",
-        arguments: {},
-      });
-      expect(result.isError, JSON.stringify(result.structuredContent)).not.toBe(
-        true,
-      );
-      const trace = dylibResolutionResultSchema.parse(
-        structuredResult(result.structuredContent),
-      );
-      const overrides = setting.startsWith("DYLD_LIBRARY_PATH=");
-      expect(trace.edges[0]?.resolution.status).toBe(
-        overrides ? "conditional" : "resolved",
-      );
-      expect(trace.coverage.status).toBe(overrides ? "partial" : "complete");
-      expect(
-        trace.images.find(({ path }) => path === "program")?.slices[0]
-          ?.dyld_environment,
-      ).toEqual([setting]);
+it.each([
+  "DYLD_LIBRARY_PATH=/external",
+  "DYLD_PRINT_RPATHS=1",
+  "DYLD_FALLBACK_LIBRARY_PATH=/external",
+  "DYLD_FRAMEWORK_PATH=/external",
+])("preserves %s and its resolution semantics through MCP", async (setting) => {
+  const root = await createTestTempDirectory("rea-dylib-environment-mcp-");
+  const program = join(root, "program");
+  await writeFile(
+    program,
+    machoImage({
+      commands: [
+        dyldEnvironmentCommand(setting),
+        buildVersionCommand(1),
+        dylibCommand(LC.LOAD_DYLIB, "@loader_path/child.dylib"),
+      ],
+    }),
+  );
+  await writeFile(
+    join(root, "child.dylib"),
+    machoImage({
+      fileType: FILE_TYPE.dylib,
+      commands: [buildVersionCommand(1)],
+    }),
+  );
+  await withClient(async (client) => {
+    const opened = await client.callTool({
+      name: "open_binary",
+      arguments: { path: program },
     });
-  },
-);
+    expect(opened.isError).not.toBe(true);
+    const result = await client.callTool({
+      name: "trace_dylib_resolution",
+      arguments: {},
+    });
+    expect(result.isError, JSON.stringify(result.structuredContent)).not.toBe(
+      true,
+    );
+    const trace = dylibResolutionResultSchema.parse(
+      structuredResult(result.structuredContent),
+    );
+    const overrides = setting.startsWith("DYLD_LIBRARY_PATH=");
+    expect(trace.edges[0]?.resolution.status).toBe(
+      overrides ? "conditional" : "resolved",
+    );
+    expect(trace.coverage.status).toBe(overrides ? "partial" : "complete");
+    expect(
+      trace.images.find(({ path }) => path === "program")?.slices[0]
+        ?.dyld_environment,
+    ).toEqual([setting]);
+  });
+});

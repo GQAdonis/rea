@@ -263,6 +263,8 @@ cliTest(
     for (const [setting, expected] of [
       ["DYLD_LIBRARY_PATH=/external", "conditional"],
       ["DYLD_PRINT_LIBRARIES=1", "resolved"],
+      ["DYLD_FALLBACK_LIBRARY_PATH=/external", "resolved"],
+      ["DYLD_FRAMEWORK_PATH=/external", "resolved"],
     ] as const) {
       const app = await fixtureApp();
       await writeFiles(app, {

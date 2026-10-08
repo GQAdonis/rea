@@ -10,6 +10,11 @@ import {
 } from "./dyldPaths.js";
 import { digestSchema } from "../digests.js";
 import {
+  hasApplicableDyldOverrides,
+  embeddedDyldOverrides,
+  type DyldSearchOverride,
+} from "./dyldEnvironment.js";
+import {
   DYLIB_RESOLUTION_LIMITATIONS,
   deriveFindings,
 } from "./dylibResolutionFindings.js";
@@ -195,29 +200,6 @@ export type DylibTrace = Omit<
   > & { readonly sha256?: never })[];
 };
 
-// Apple's PathOverrides consumes these variable names. Print/logging variables
-// remain observations and do not change which library a search selects.
-const DYLD_PATH_VARIABLES: ReadonlySet<string> = new Set([
-  "DYLD_LIBRARY_PATH",
-  "DYLD_FRAMEWORK_PATH",
-  "DYLD_FALLBACK_LIBRARY_PATH",
-  "DYLD_FALLBACK_FRAMEWORK_PATH",
-  "DYLD_VERSIONED_LIBRARY_PATH",
-  "DYLD_VERSIONED_FRAMEWORK_PATH",
-  "DYLD_INSERT_LIBRARIES",
-  "DYLD_IMAGE_SUFFIX",
-  "DYLD_ROOT_PATH",
-  "DYLD_OVERLAY_PATH",
-]);
-
-const hasDyldPathOverrides = (slice: MachoSlice): boolean =>
-  slice.dyld_environment.some((setting) => {
-    const delimiter = setting.indexOf("=");
-    return (
-      delimiter > 0 && DYLD_PATH_VARIABLES.has(setting.slice(0, delimiter))
-    );
-  });
-
 interface LoadedImage {
   readonly slice: MachoSlice;
   /** Images from the process root to this image; the rpath stack, outermost first. */
@@ -230,7 +212,8 @@ interface ProcessContext {
   readonly view: DylibTreeView;
   readonly root: string;
   readonly architecture: string;
-  readonly searchPathsUnknown: boolean;
+  readonly searchOverrides: readonly DyldSearchOverride[];
+  readonly environmentRoots: Set<string>;
   readonly platforms: readonly number[];
   readonly executable: string | null;
   readonly loaded: Map<string, LoadedImage>;
@@ -451,9 +434,17 @@ const resolveDependency = async (
       if (candidate.outcome === "resolved") break;
     }
   const modeled = resolution(candidates);
-  // Embedded overrides apply process-wide, before the modeled path search.
-  // A missing modeled candidate does not prove a missing runtime dependency.
-  const searched: Edge["resolution"] = context.searchPathsUnknown
+  const searchUnknown =
+    loaded === undefined &&
+    hasApplicableDyldOverrides(
+      context.searchOverrides,
+      dependency.install_name,
+      modeled.image !== null,
+    );
+  if (searchUnknown) context.environmentRoots.add(context.root);
+  // Fallbacks cannot preempt a modeled hit, and framework paths do not
+  // override ordinary dylibs. Reuse inherits uncertainty from the first load.
+  const searched: Edge["resolution"] = searchUnknown
     ? {
         ...modeled,
         status: modeled.image === null ? "undetermined" : "conditional",
@@ -573,8 +564,15 @@ export const traceDylibLoading = async (
     );
     if (slices.length === 0) withoutArchitecture.push(root);
     for (const slice of slices) {
-      const searchPathsUnknown = hasDyldPathOverrides(slice);
-      if (searchPathsUnknown) environmentRoots.add(root);
+      const searchOverrides = embeddedDyldOverrides(slice.dyld_environment);
+      // Inserted libraries introduce unexamined images even without dependencies.
+      if (
+        searchOverrides.some(
+          ({ variable, value }) =>
+            variable === "DYLD_INSERT_LIBRARIES" && value !== "",
+        )
+      )
+        environmentRoots.add(root);
       roots.push({ image: root, architecture: slice.architecture });
       edges.push(
         ...(await traceProcess(
@@ -582,7 +580,8 @@ export const traceDylibLoading = async (
             view,
             root,
             architecture: slice.architecture,
-            searchPathsUnknown,
+            searchOverrides,
+            environmentRoots,
             platforms: slice.platforms,
             executable: slice.file_type === "execute" ? root : null,
             loaded: new Map(),
@@ -631,7 +630,7 @@ export const traceDylibLoading = async (
       ...(environmentRoots.size === 0
         ? []
         : [
-            `Roots ${[...environmentRoots].join(", ")} set image-selection overrides through LC_DYLD_ENVIRONMENT; their resolutions are conditional because those process search inputs are not modeled.`,
+            `Roots ${[...environmentRoots].join(", ")} request applicable image-selection inputs through LC_DYLD_ENVIRONMENT that are not modeled; affected dependencies or inserted images remain uncertain.`,
           ]),
     ],
   };
