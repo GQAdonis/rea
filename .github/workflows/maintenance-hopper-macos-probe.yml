@@ -1,0 +1,90 @@
+name: Temporary native macOS Hopper probe
+
+on:
+  push:
+    branches: [validation/hopper-macos-demo-20261008]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-hopper-macos-probe
+  cancel-in-progress: true
+
+env:
+  HUSKY: "0"
+  NODE_OPTIONS: --max-old-space-size=768
+  GOMAXPROCS: "1"
+  MAKEFLAGS: -j1
+  REA_TEST_WORKERS: "1"
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Download and verify the official demo in a private directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe="${RUNNER_TEMP}/rea-hopper-probe"
+          mkdir -p "${probe}/mount" "${probe}/evidence"
+          curl --fail --location --max-time 90 --user-agent 'Mozilla/5.0' \
+            'https://www.hopperapp.com:443/downloader/public/Hopper-6.6.0-demo.dmg' \
+            --output "${probe}/hopper.dmg"
+          test "$(stat -f %z "${probe}/hopper.dmg")" = 34846271
+          echo "0be530f038249742590992199c7b042ea20ca955  ${probe}/hopper.dmg" | shasum -a 1 --check
+          hdiutil attach -readonly -nobrowse -mountpoint "${probe}/mount" "${probe}/hopper.dmg"
+          trap 'hdiutil detach "${probe}/mount" -force' EXIT
+          source_app="$(python3 -c 'import pathlib,sys; apps=list(pathlib.Path(sys.argv[1]).glob("Hopper*.app")); assert len(apps)==1; print(apps[0])' "${probe}/mount")"
+          codesign --verify --deep --strict "${source_app}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${source_app}/Contents/Info.plist")" = com.cryptic-apps.hopper-web-4
+          ditto "${source_app}" "${probe}/Hopper.app"
+          echo "HOPPER_LAUNCHER_PATH=${probe}/Hopper.app/Contents/MacOS/hopper" >> "${GITHUB_ENV}"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${probe}/Hopper.app/Contents/Info.plist"
+          shasum -a 256 "${probe}/Hopper.app/Contents/MacOS/Hopper Disassembler v6" || true
+      - name: Build host-native fixtures and install the package privately
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run verify:fixtures
+          tarball="$(npm pack --silent)"
+          npm install --prefix "${RUNNER_TEMP}/rea-hopper-probe/prefix" --omit=dev --ignore-scripts --no-audit --no-fund "./${tarball}"
+          shasum -a 256 "./${tarball}"
+          echo "REA_VERIFY_SERVER_COMMAND=${RUNNER_TEMP}/rea-hopper-probe/prefix/node_modules/.bin/rea" >> "${GITHUB_ENV}"
+          echo 'REA_VERIFY_SERVER_ARGS_JSON=["mcp"]' >> "${GITHUB_ENV}"
+      - name: Verify the real provider and lifecycle
+        id: hopper
+        timeout-minutes: 6
+        continue-on-error: true
+        shell: bash
+        run: |
+          node scripts/verify-real-hopper.mjs \
+            > "${RUNNER_TEMP}/rea-hopper-probe/evidence/real-hopper.json" \
+            2> "${RUNNER_TEMP}/rea-hopper-probe/evidence/real-hopper.stderr"
+      - name: Capture the owned runner's GUI and process observations
+        if: always()
+        shell: bash
+        run: |
+          probe="${RUNNER_TEMP}/rea-hopper-probe"
+          mkdir -p "${probe}/evidence"
+          screencapture -x "${probe}/evidence/desktop.png" || true
+          ps -axo pid,ppid,command | rg 'Hopper|WindowServer' > "${probe}/evidence/processes.txt" || true
+          osascript -e 'tell application "System Events" to get {name, visible} of every application process whose bundle identifier is "com.cryptic-apps.hopper-web-4"' > "${probe}/evidence/gui.txt" 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-macos-hopper-probe
+          path: ${{ runner.temp }}/rea-hopper-probe/evidence
+          retention-days: 3
+      - name: Require successful real verification
+        if: always()
+        env:
+          HOPPER_OUTCOME: ${{ steps.hopper.outcome }}
+        run: test "${HOPPER_OUTCOME}" = success
