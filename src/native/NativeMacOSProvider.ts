@@ -57,6 +57,7 @@ import {
 import {
   bindSignatureTarget,
   verifySignatureTarget,
+  type SignatureTargetBinding,
 } from "./SignatureTargetBinding.js";
 import { parseCodeSignature } from "./parsers/codesign.js";
 import { parseDemangledSymbols } from "./parsers/demangle.js";
@@ -324,30 +325,27 @@ class NativeMacOSClient implements AnalysisClient {
   ): Promise<Result<NativeObservation, AnalysisError>> {
     const binding = await bindSignatureTarget(this.target, signal);
     if (!binding.ok) return binding;
-    const display = await this.#run(
-      "inspect_signature",
-      "codesign",
+    const display = await this.#captureSignature(
+      binding.value,
       ["-d", "--verbose=4", this.target.path],
-      { signal, acceptNonZero: true },
+      signal,
     );
     if (!display.ok) return display;
     const unsigned = isNonzeroUnsignedObservation(display.value);
     const displayFailure = codeSignCaptureFailure(display.value);
     if (displayFailure !== null) return err(displayFailure);
-    const requirements = await this.#run(
-      "inspect_signature",
-      "codesign",
+    const requirements = await this.#captureSignature(
+      binding.value,
       ["-d", "-r-", this.target.path],
-      { signal, acceptNonZero: true },
+      signal,
     );
     if (!requirements.ok) return requirements;
     const requirementsFailure = codeSignCaptureFailure(requirements.value);
     if (requirementsFailure !== null) return err(requirementsFailure);
-    const entitlements = await this.#run(
-      "inspect_signature",
-      "codesign",
+    const entitlements = await this.#captureSignature(
+      binding.value,
       ["-d", "--entitlements", ":-", this.target.path],
-      { signal, acceptNonZero: true },
+      signal,
     );
     if (!entitlements.ok) return entitlements;
     const entitlementsFailure = codeSignCaptureFailure(entitlements.value);
@@ -377,9 +375,12 @@ class NativeMacOSClient implements AnalysisClient {
         isNonzeroUnsignedObservation(entitlements.value));
     if (mixedSigning) {
       const slices = await this.#inspectMixedSignatureSlices(
+        binding.value,
         parsed.format,
-        requirements.value.exitCode !== 0,
-        entitlements.value.exitCode !== 0,
+        {
+          requirements: requirements.value.exitCode,
+          entitlements: entitlements.value.exitCode,
+        },
         signal,
       );
       if (!slices.ok) return slices;
@@ -411,20 +412,22 @@ class NativeMacOSClient implements AnalysisClient {
   }
 
   async #inspectMixedSignatureSlices(
+    binding: SignatureTargetBinding,
     format: string | null,
-    requirementsUnavailable: boolean,
-    entitlementsUnavailable: boolean,
+    aggregateExits: Readonly<{
+      requirements: number | null;
+      entitlements: number | null;
+    }>,
     signal?: AbortSignal,
   ): Promise<Result<MixedSignatureSlices, AnalysisError>> {
     const captures: NativeCommandCapture[] = [];
     const unsigned: string[] = [];
     const unclassified: string[] = [];
     for (const architecture of codeSignArchitectures(format, this.target)) {
-      const slice = await this.#run(
-        "inspect_signature",
-        "codesign",
+      const slice = await this.#captureSignature(
+        binding,
         ["-d", "-a", architecture, "--verbose=4", this.target.path],
-        { signal, acceptNonZero: true },
+        signal,
       );
       if (!slice.ok) return slice;
       captures.push(slice.value);
@@ -442,15 +445,46 @@ class NativeMacOSClient implements AnalysisClient {
       limitations.push(
         `Signature state could not be classified for Mach-O slices: ${unclassified.join(", ")}.`,
       );
-    if (requirementsUnavailable)
+    if (aggregateExits.requirements !== 0)
       limitations.push(
         "The aggregate designated requirement is unavailable because Mach-O slices have mixed signing states.",
       );
-    if (entitlementsUnavailable)
+    if (aggregateExits.entitlements !== 0)
       limitations.push(
         "The aggregate entitlements are unavailable because Mach-O slices have mixed signing states.",
       );
     return ok({ captures, limitations });
+  }
+
+  async #captureSignature(
+    binding: SignatureTargetBinding,
+    args: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<Result<NativeCommandCapture, AnalysisError>> {
+    const before = await verifySignatureTarget(this.target, binding, signal);
+    if (!before.ok) return before;
+    let capture: Result<NativeCommandCapture, AnalysisError>;
+    try {
+      capture = await this.#run("inspect_signature", "codesign", args, {
+        signal,
+        acceptNonZero: true,
+      });
+    } catch (cause: unknown) {
+      capture = err(
+        new ProviderAdapterError(IDENTITY.id, "inspect_signature", {
+          cause,
+          diagnostics: {
+            phase: "codesign-capture",
+            path: this.target.path,
+            reason: cause instanceof Error ? cause.message : String(cause),
+          },
+        }),
+      );
+    }
+    // Verify failed captures too: a disappearing target is not a codesign
+    // execution failure, and later captures must never use another version.
+    const after = await verifySignatureTarget(this.target, binding, signal);
+    return after.ok ? capture : after;
   }
 
   async #inspectPlist(

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -19,13 +18,9 @@ import { parseCodeSignature } from "../../../../src/native/parsers/codesign.js";
 import {
   NativeFixtureRunner as FixtureRunner,
   nativeFixture as fixture,
-  nativeMachoTarget as unboundMachoTarget,
+  nativeMachoTarget as machoTarget,
+  nativeMachoTargetForFile,
 } from "../../../fixtures/nativeCommands.js";
-
-const machoTarget = (path: string, app?: string) => ({
-  ...unboundMachoTarget(path, app),
-  sha256: createHash("sha256").update("fixture").digest("hex"),
-});
 
 let directory: string | undefined;
 afterEach(async () => {
@@ -248,7 +243,7 @@ describe("native macOS provider inspection", () => {
     const client = new NativeMacOSProvider(
       new FixtureRunner(),
       "darwin",
-    ).createClient(machoTarget(executable, app));
+    ).createClient(await nativeMachoTargetForFile(executable, app));
 
     const architectures = await client.execute("list_architectures", {});
     expect(architectures.ok && architectures.value.result).toMatchObject({
@@ -330,7 +325,7 @@ describe("native signature entitlements", () => {
     const client = new NativeMacOSProvider(
       new PrototypeEntitlementsRunner(),
       "darwin",
-    ).createClient(machoTarget(executable));
+    ).createClient(await nativeMachoTargetForFile(executable));
 
     const signature = await client.execute("inspect_signature", {});
 

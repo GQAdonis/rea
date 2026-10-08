@@ -6,6 +6,7 @@ import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import {
   AnalysisAccessDeniedError,
   AnalysisArtifactChangedError,
+  AnalysisCancelledError,
   AnalysisResourceConstraintError,
 } from "../domain/analysisErrorCore.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
@@ -65,9 +66,10 @@ export const bindSignatureTarget = async (
   target: BinaryTarget,
   signal?: AbortSignal,
 ): Promise<Result<SignatureTargetBinding, AnalysisError>> => {
-  signal?.throwIfAborted();
   try {
+    signal?.throwIfAborted();
     const before = await lstat(target.path, { bigint: true });
+    signal?.throwIfAborted();
     if (!before.isFile() || before.isSymbolicLink())
       return changedTarget(
         target,
@@ -79,6 +81,7 @@ export const bindSignatureTarget = async (
     );
     try {
       const opened = await file.stat({ bigint: true });
+      signal?.throwIfAborted();
       if (identity(opened) !== identity(before))
         return changedTarget(
           target,
@@ -105,6 +108,7 @@ export const bindSignatureTarget = async (
           Math.min(chunk.length, size - position),
           position,
         );
+        signal?.throwIfAborted();
         if (bytesRead === 0)
           return changedTarget(
             target,
@@ -121,6 +125,7 @@ export const bindSignatureTarget = async (
         );
       const after = await file.stat({ bigint: true });
       const current = await lstat(target.path, { bigint: true });
+      signal?.throwIfAborted();
       if (
         identity(after) !== identity(opened) ||
         identity(current) !== identity(opened)
@@ -134,8 +139,11 @@ export const bindSignatureTarget = async (
       await file.close();
     }
   } catch (cause: unknown) {
-    signal?.throwIfAborted();
-    return err(signatureReadFailure(target, cause));
+    return err(
+      signal?.aborted
+        ? new AnalysisCancelledError("inspect_signature")
+        : signatureReadFailure(target, cause),
+    );
   }
 };
 
@@ -145,9 +153,10 @@ export const verifySignatureTarget = async (
   binding: SignatureTargetBinding,
   signal?: AbortSignal,
 ): Promise<Result<void, AnalysisError>> => {
-  signal?.throwIfAborted();
   try {
+    signal?.throwIfAborted();
     const current = await lstat(target.path, { bigint: true });
+    signal?.throwIfAborted();
     return current.isFile() && identity(current) === binding.identity
       ? ok(undefined)
       : changedTarget(
@@ -155,7 +164,10 @@ export const verifySignatureTarget = async (
           `Signature target changed during inspection: ${target.path}`,
         );
   } catch (cause: unknown) {
-    signal?.throwIfAborted();
-    return err(signatureReadFailure(target, cause));
+    return err(
+      signal?.aborted
+        ? new AnalysisCancelledError("inspect_signature")
+        : signatureReadFailure(target, cause),
+    );
   }
 };
