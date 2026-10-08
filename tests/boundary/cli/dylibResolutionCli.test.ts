@@ -7,10 +7,12 @@ import {
   FILE_TYPE,
   LC,
   dylibCommand,
+  dyldEnvironmentCommand,
   machoImage,
   rpathCommand,
 } from "../../../src/artifacts/apple/MachoImage.fixture.js";
 import { dylibResolutionResultSchema } from "../../../src/domain/apple/dylibResolution.js";
+import { parseEvidence } from "../../../src/domain/evidence.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { cliTest } from "../../support/cli/cliFixture.js";
 
@@ -240,5 +242,53 @@ describe.skipIf(process.getuid?.() === 0)(
         }
       },
     );
+  },
+);
+
+cliTest(
+  "reports embedded path overrides as conditional without changing diagnostic-only resolution",
+  async ({ cli }) => {
+    for (const [setting, expected] of [
+      ["DYLD_LIBRARY_PATH=/external", "conditional"],
+      ["DYLD_PRINT_LIBRARIES=1", "resolved"],
+    ] as const) {
+      const app = await fixtureApp();
+      await writeFiles(app, {
+        "Contents/MacOS/App": machoImage({
+          commands: [
+            dyldEnvironmentCommand(setting),
+            rpathCommand("@executable_path/../Absent"),
+            rpathCommand("@executable_path/../Frameworks"),
+            dylibCommand(LC.LOAD_DYLIB, "@rpath/libcore.dylib"),
+          ],
+        }),
+      });
+      const result = await cli.run({
+        arguments: [
+          "trace-dylib-resolution",
+          app,
+          "--root",
+          "Contents/MacOS/App",
+          "--json",
+        ],
+        environment: ENVIRONMENT,
+      });
+      expect(result.exitCode, JSON.stringify(result.json)).toBe(0);
+      const trace = dylibResolutionResultSchema.parse(
+        parseEvidence(result.json).normalized_result,
+      );
+      expect(trace.edges[0]?.resolution.status).toBe(expected);
+      expect(trace.coverage.status).toBe(
+        expected === "conditional" ? "partial" : "complete",
+      );
+      expect(
+        trace.images.find(({ path }) => path === "Contents/MacOS/App")
+          ?.slices[0]?.dyld_environment,
+      ).toEqual([setting]);
+      if (expected === "conditional")
+        expect(trace.findings[0]?.explanation).toContain(
+          "does not establish which image dyld will load",
+        );
+    }
   },
 );

@@ -144,7 +144,7 @@ describe("dyld path expansion", () => {
         }),
         [plugin]: parsed(
           slice({
-            file_type: "bundle",
+            file_type: "dylib",
             dependencies: [dependency("@rpath/libshared.dylib")],
           }),
         ),
@@ -300,13 +300,15 @@ describe("dyld resolution outcomes", () => {
       trace.findings.map(({ kind, edge_index: index }) => [kind, index]),
     ).toEqual([
       ["earlier-rpath-candidate-absent", 0],
-      ["weak-load-unresolved", 1],
-      ["required-load-unresolved", 2],
       ["dyld-environment-present", null],
     ]);
     expect(trace.findings[0]?.explanation).toContain(
       "Contents/MacOS/../Overrides/libfound.dylib",
     );
+    expect(trace.findings[0]?.explanation).toContain(
+      "Unmodeled environment overrides",
+    );
+    expect(trace.coverage.status).toBe("partial");
   });
 
   it("reports non-Mach-O, malformed and wrong-architecture candidates", async () => {
@@ -603,3 +605,87 @@ describe("conditional loads", () => {
       ).toContain(`${VENDOR} loads only conditionally; if it loads,`);
   });
 });
+
+it("propagates embedded search-path uncertainty through found, missing, lazy and descendant edges", async () => {
+  const child = "Contents/MacOS/child.dylib";
+  const trace = await traceDylibLoading(
+    memoryView({
+      [MAIN]: executable({
+        dyld_environment: ["DYLD_LIBRARY_PATH=/tmp"],
+        dependencies: [
+          dependency("@executable_path/child.dylib"),
+          dependency("@executable_path/missing.dylib"),
+          dependency("@executable_path/lazy.dylib", {
+            command: "LC_LAZY_LOAD_DYLIB",
+          }),
+        ],
+      }),
+      [child]: parsed(
+        slice({ dependencies: [dependency("@loader_path/gone.dylib")] }),
+      ),
+    }),
+    { roots: [MAIN] },
+  );
+  expect(trace.edges.map(({ resolution }) => resolution.status)).toEqual([
+    "conditional",
+    "undetermined",
+    "undetermined",
+    "undetermined",
+  ]);
+  expect(trace.edges.at(-1)?.loader_conditional).toBe(true);
+  expect(trace.findings.map(({ kind }) => kind)).toEqual([
+    "dyld-environment-present",
+  ]);
+});
+
+it.each([
+  "DYLD_PRINT_LIBRARIES=1",
+  "DYLD_PRINT_RPATHS=1",
+  "DYLD_LIBRARY_PATH_LOG=/tmp",
+  "DYLD_LIBRARY_PATH",
+])(
+  "retains %s as an observation without adding path uncertainty",
+  async (setting) => {
+    const child = "Contents/MacOS/child.dylib";
+    const trace = await traceDylibLoading(
+      memoryView({
+        [MAIN]: executable({
+          dyld_environment: [setting],
+          dependencies: [dependency("@executable_path/child.dylib")],
+        }),
+        [child]: parsed(slice()),
+      }),
+      { roots: [MAIN] },
+    );
+    expect(trace.edges[0]?.resolution.status).toBe("resolved");
+    expect(trace.coverage.status).toBe("complete");
+    expect(
+      trace.images.find(({ path }) => path === MAIN)?.slices[0]
+        ?.dyld_environment,
+    ).toEqual([setting]);
+    expect(trace.findings.map(({ kind }) => kind)).toContain(
+      "dyld-environment-present",
+    );
+  },
+);
+
+it.each(["execute", "bundle", "other"] as const)(
+  "does not resolve a %s image as a dylib dependency",
+  async (file_type) => {
+    const child = "Contents/MacOS/child.dylib";
+    const trace = await traceDylibLoading(
+      memoryView({
+        [MAIN]: executable({
+          dependencies: [dependency("@executable_path/child.dylib")],
+        }),
+        [child]: parsed(slice({ file_type })),
+      }),
+      { roots: [MAIN] },
+    );
+    expect(trace.edges[0]).toMatchObject({
+      candidates: [{ outcome: "unsupported" }],
+      resolution: { status: "undetermined", image: null },
+    });
+    expect(trace.edges).toHaveLength(1);
+  },
+);

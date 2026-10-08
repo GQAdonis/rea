@@ -180,6 +180,29 @@ export type DylibTrace = Omit<
   > & { readonly sha256?: never })[];
 };
 
+// Apple's PathOverrides consumes these variable names. Print/logging variables
+// remain observations and do not change which library a search selects.
+const DYLD_PATH_VARIABLES: ReadonlySet<string> = new Set([
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_FALLBACK_LIBRARY_PATH",
+  "DYLD_FALLBACK_FRAMEWORK_PATH",
+  "DYLD_VERSIONED_LIBRARY_PATH",
+  "DYLD_VERSIONED_FRAMEWORK_PATH",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_IMAGE_SUFFIX",
+  "DYLD_ROOT_PATH",
+  "DYLD_OVERLAY_PATH",
+]);
+
+const hasDyldPathOverrides = (slice: MachoSlice): boolean =>
+  slice.dyld_environment.some((setting) => {
+    const delimiter = setting.indexOf("=");
+    return (
+      delimiter > 0 && DYLD_PATH_VARIABLES.has(setting.slice(0, delimiter))
+    );
+  });
+
 interface LoadedImage {
   readonly slice: MachoSlice;
   /** Images from the process root to this image; the rpath stack, outermost first. */
@@ -192,6 +215,7 @@ interface ProcessContext {
   readonly view: DylibTreeView;
   readonly root: string;
   readonly architecture: string;
+  readonly searchPathsUnknown: boolean;
   readonly executable: string | null;
   readonly loaded: Map<string, LoadedImage>;
   readonly byInstallName: Map<string, string>;
@@ -269,12 +293,18 @@ const evaluateCandidate = async (
   if (lookup.kind !== "file")
     return { ...base, outcome: "absent", resolved_path: null };
   const facts = await imageFacts(context, lookup.path);
+  const slice =
+    facts.status === "parsed"
+      ? compatibleSlice(facts.slices, context.architecture)
+      : undefined;
   const outcome: Candidate["outcome"] =
     facts.status !== "parsed"
       ? facts.status
-      : compatibleSlice(facts.slices, context.architecture) === undefined
+      : slice === undefined
         ? "architecture-missing"
-        : "resolved";
+        : slice.file_type !== "dylib"
+          ? "unsupported"
+          : "resolved";
   return { ...base, outcome, resolved_path: lookup.path };
 };
 
@@ -334,7 +364,15 @@ const resolveDependency = async (
       // dyld stops at the first loadable candidate.
       if (candidate.outcome === "resolved") break;
     }
-  const searched = resolution(candidates);
+  const modeled = resolution(candidates);
+  // Embedded overrides apply process-wide, before the modeled path search.
+  // A missing modeled candidate does not prove a missing runtime dependency.
+  const searched: Edge["resolution"] = context.searchPathsUnknown
+    ? {
+        ...modeled,
+        status: modeled.image === null ? "undetermined" : "conditional",
+      }
+    : modeled;
   // Reusing an image that itself loads only conditionally is conditional too.
   const resolved: Edge["resolution"] =
     loaded !== undefined &&
@@ -437,6 +475,7 @@ export const traceDylibLoading = async (
   const roots: DylibTrace["roots"][number][] = [];
   const edges: Edge[] = [];
   const withoutArchitecture: string[] = [];
+  const environmentRoots = new Set<string>();
   for (const root of request.roots) {
     const facts = await view.image(root);
     images.set(root, facts);
@@ -448,6 +487,8 @@ export const traceDylibLoading = async (
     );
     if (slices.length === 0) withoutArchitecture.push(root);
     for (const slice of slices) {
+      const searchPathsUnknown = hasDyldPathOverrides(slice);
+      if (searchPathsUnknown) environmentRoots.add(root);
       roots.push({ image: root, architecture: slice.architecture });
       edges.push(
         ...(await traceProcess(
@@ -455,6 +496,7 @@ export const traceDylibLoading = async (
             view,
             root,
             architecture: slice.architecture,
+            searchPathsUnknown,
             executable: slice.file_type === "execute" ? root : null,
             loaded: new Map(),
             byInstallName: new Map(),
@@ -489,13 +531,22 @@ export const traceDylibLoading = async (
     findings: deriveFindings(edges, roots, images),
     coverage: {
       status:
-        unparsed.length === 0 && withoutArchitecture.length === 0
+        unparsed.length === 0 &&
+        withoutArchitecture.length === 0 &&
+        environmentRoots.size === 0
           ? "complete"
           : "partial",
       unparsed_images: unparsed,
       roots_without_architecture: withoutArchitecture,
     },
-    limitations: DYLIB_RESOLUTION_LIMITATIONS,
+    limitations: [
+      ...DYLIB_RESOLUTION_LIMITATIONS,
+      ...(environmentRoots.size === 0
+        ? []
+        : [
+            `Roots ${[...environmentRoots].join(", ")} set image-selection overrides through LC_DYLD_ENVIRONMENT; their resolutions are conditional because those process search inputs are not modeled.`,
+          ]),
+    ],
   };
 };
 
