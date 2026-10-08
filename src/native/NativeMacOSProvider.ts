@@ -54,6 +54,10 @@ import {
   type NativeCommandCapture,
   type NativeCommandRunner,
 } from "./CommandRunner.js";
+import {
+  bindSignatureTarget,
+  verifySignatureTarget,
+} from "./SignatureTargetBinding.js";
 import { parseCodeSignature } from "./parsers/codesign.js";
 import { parseDemangledSymbols } from "./parsers/demangle.js";
 import { parseLipoArchitectures } from "./parsers/lipo.js";
@@ -318,6 +322,8 @@ class NativeMacOSClient implements AnalysisClient {
   async #inspectSignature(
     signal?: AbortSignal,
   ): Promise<Result<NativeObservation, AnalysisError>> {
+    const binding = await bindSignatureTarget(this.target, signal);
+    if (!binding.ok) return binding;
     const display = await this.#run(
       "inspect_signature",
       "codesign",
@@ -383,6 +389,12 @@ class NativeMacOSClient implements AnalysisClient {
     const provenance = captures.map((capture) =>
       invocation(capture, this.target.path),
     );
+    const version = await verifySignatureTarget(
+      this.target,
+      binding.value,
+      signal,
+    );
+    if (!version.ok) return version;
     const result = inspectSignatureSchema.parse({
       ...parsed,
       designated_requirement: requirementText,

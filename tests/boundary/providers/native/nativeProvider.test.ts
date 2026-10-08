@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -18,8 +19,13 @@ import { parseCodeSignature } from "../../../../src/native/parsers/codesign.js";
 import {
   NativeFixtureRunner as FixtureRunner,
   nativeFixture as fixture,
-  nativeMachoTarget as machoTarget,
+  nativeMachoTarget as unboundMachoTarget,
 } from "../../../fixtures/nativeCommands.js";
+
+const machoTarget = (path: string, app?: string) => ({
+  ...unboundMachoTarget(path, app),
+  sha256: createHash("sha256").update("fixture").digest("hex"),
+});
 
 let directory: string | undefined;
 afterEach(async () => {
@@ -318,10 +324,13 @@ class PrototypeEntitlementsRunner extends FixtureRunner {
 
 describe("native signature entitlements", () => {
   it("reports entitlement entries keyed __proto__ that the result omits", async () => {
+    directory = await createTestTempDirectory("rea-signature-entitlements-");
+    const executable = join(directory, "fixture");
+    await writeFile(executable, "fixture");
     const client = new NativeMacOSProvider(
       new PrototypeEntitlementsRunner(),
       "darwin",
-    ).createClient(machoTarget("/private/fixture"));
+    ).createClient(machoTarget(executable));
 
     const signature = await client.execute("inspect_signature", {});
 
