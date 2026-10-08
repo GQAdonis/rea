@@ -9,6 +9,7 @@ import { ArtifactProvider } from "../../../src/artifacts/ArtifactProvider.js";
 import {
   FILE_TYPE,
   LC,
+  buildVersionCommand,
   dylibCommand,
   dyldEnvironmentCommand,
   machoImage,
@@ -56,6 +57,7 @@ it("traces dylib resolution for an opened app bundle and rejects a changed targe
     executable,
     machoImage({
       commands: [
+        buildVersionCommand(1),
         rpathCommand("@executable_path/../Frameworks"),
         dylibCommand(LC.LOAD_DYLIB, "@rpath/libcore.dylib"),
       ],
@@ -63,7 +65,10 @@ it("traces dylib resolution for an opened app bundle and rejects a changed targe
   );
   await writeFile(
     join(app, "Contents/Frameworks/libcore.dylib"),
-    machoImage({ fileType: FILE_TYPE.dylib }),
+    machoImage({
+      fileType: FILE_TYPE.dylib,
+      commands: [buildVersionCommand(1)],
+    }),
   );
   await withClient(async (client) => {
     const opened = await client.callTool({
@@ -130,12 +135,18 @@ it("traces a standalone Mach-O file whose name ends in .app", async () => {
   await writeFile(
     join(directory, "Tool.app"),
     machoImage({
-      commands: [dylibCommand(LC.LOAD_DYLIB, "@loader_path/libcore.dylib")],
+      commands: [
+        buildVersionCommand(1),
+        dylibCommand(LC.LOAD_DYLIB, "@loader_path/libcore.dylib"),
+      ],
     }),
   );
   await writeFile(
     join(directory, "libcore.dylib"),
-    machoImage({ fileType: FILE_TYPE.dylib }),
+    machoImage({
+      fileType: FILE_TYPE.dylib,
+      commands: [buildVersionCommand(1)],
+    }),
   );
   await withClient(async (client) => {
     const opened = await client.callTool({
@@ -205,13 +216,17 @@ it.each(["DYLD_LIBRARY_PATH=/external", "DYLD_PRINT_RPATHS=1"])(
       machoImage({
         commands: [
           dyldEnvironmentCommand(setting),
+          buildVersionCommand(1),
           dylibCommand(LC.LOAD_DYLIB, "@loader_path/child.dylib"),
         ],
       }),
     );
     await writeFile(
       join(root, "child.dylib"),
-      machoImage({ fileType: FILE_TYPE.dylib }),
+      machoImage({
+        fileType: FILE_TYPE.dylib,
+        commands: [buildVersionCommand(1)],
+      }),
     );
     await withClient(async (client) => {
       const opened = await client.callTool({
